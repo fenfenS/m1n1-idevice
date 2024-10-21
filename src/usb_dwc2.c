@@ -20,15 +20,14 @@
 #include "uart.h"
 #include "usb_dwc2.h"
 #include "usb_dwc2_regs.h"
-#include "usb_dwc3.h" //import cdc_acm_pipe_id_t
-#include "usb_dwc3_regs.h"
 #include "usb_types.h"
 #include "utils.h"
 
 #define MAX_ENDPOINTS   8
 #define CDC_BUFFER_SIZE SZ_1M
 
-#define usb_debug_printf(fmt, ...) //uart_printf_uniq("usb-dwc2: " fmt, ##__VA_ARGS__)
+#define usb_debug_printf(fmt, ...) //uart_printf("usb-dwc2: " fmt, ##__VA_ARGS__)
+//enable uart_printf would lead usb time error
 
 #define usb_error_printf(fmt, ...) uart_printf("usb-dwc2[ERR]: " fmt, ##__VA_ARGS__)
 
@@ -48,7 +47,6 @@
 #define CDC_INTERFACE_PROTOCOL_NONE 0x00
 #define CDC_INTERFACE_PROTOCOL_AT   0x01
 
-#define DWC3_SCRATCHPAD_SIZE SZ_16K
 #define TRB_BUFFER_SIZE      SZ_16K
 #define XFER_BUFFER_SIZE     (SZ_16K * MAX_ENDPOINTS * 2)
 #define PAD_BUFFER_SIZE      SZ_16K
@@ -140,7 +138,7 @@ typedef struct dwc2_dev {
         bool ready;
         /* USB ACM CDC serial */
         u8 cdc_line_coding[7];
-    } pipe[CDC_ACM_PIPE_MAX];
+    } pipe[CDC_ACM_DWC2_PIPE_MAX];
 
 } dwc2_dev_t;
 
@@ -368,6 +366,14 @@ static const char *ep0_state_names[] = {
     "STATE_DATA_SEND_STATUS_DONE",
 };
 
+static void usb_set_address(dwc2_dev_t *dev, u8 address);
+static void usb_dwc2_ep_hw_recv(dwc2_dev_t *dev, u8 ep, u32 hw_xfer_size, u32 packet_count);
+static void usb_dwc2_ep_hw_send(dwc2_dev_t *dev, u8 ep, u32 hw_xfer_size, u32 packet_count);
+static void usb_dwc2_ep_abort(dwc2_dev_t *dev, u8 ep);
+static int usb_dwc2_start_status_phase(dwc2_dev_t *dev, u8 ep);
+static void usb_dwc2_cdc_start_bulk_out_xfer(dwc2_dev_t *dev, u8 endpoint_number);
+static void usb_dwc2_cdc_start_bulk_in_xfer(dwc2_dev_t *dev, u8 endpoint_number);
+
 #ifdef LOG_REGISTER_RW
 static void USB_DEBUG_PRINT_REGISTERS(dwc2_dev_t *dev)
 {
@@ -474,66 +480,34 @@ static int usb_dwc2_ep_activate(dwc2_dev_t *dev, u8 ep, u8 type, u32 max_packet_
     pep &= 0xf;
     // usb_debug_printf ("activate EP%u, is_in =%d\n", pep, is_endpoint_in);
     dev->endpoints[ep].max_packet_size = max_packet_len;
-    u32 val = (1 << 28) | (1 << 27); // sted0pid|snak
+    u32 val = DWC2_DXEPCTLi_SetD0Pid | DWC2_DXEPCTL_SetNAK;
 
-    switch (type << is_endpoint_in) {
-        case DWC3_DEPCMD_TYPE_INTR << 1:
-        case DWC3_DEPCMD_TYPE_BULK << 1:
-            ep_ctl_reg = dev->regs + DWC2_DIEPCTL(pep);
-            // usb_debug_printf("dev->regs + DWC2_DIEPCTL(pep) = %x\n", dev->regs +
-            // DWC2_DIEPCTL(pep));
-            daint_mask_shift = pep;
-            write32(ep_ctl_reg, 0);
-            u8 next_tx_fifo = pep;
-            val |= next_tx_fifo << 22; // TX_FIFO_SHIFT
-            write32(dev->regs + DWC2_DTXFSIZ(next_tx_fifo), TX_FIFO_SIZE << 16 | next_tx_fifo_addr);
-            // usb_debug_printf("DWC2_DTXFSIZ(next_tx_fifo)= %x\n", DWC2_DTXFSIZ(next_tx_fifo));
-            next_tx_fifo_addr += TX_FIFO_SIZE;
-            if (ep == 4)
-                val |= 1 << 26; // SNAK
-            break;
-
-        case DWC3_DEPCMD_TYPE_INTR:
-        case DWC3_DEPCMD_TYPE_BULK: // DIR_OUT
-            ep_ctl_reg = dev->regs + DWC2_DOEPCTL(pep);
-            daint_mask_shift = pep + 16;
-            write32(ep_ctl_reg, 0);
-            break;
-        default:
-            if (type != 0) {
-                usb_error_printf("non-support type[%u] to be activated\n", type);
-                return -1;
-            }
-            if (is_endpoint_in)
-                daint_mask_shift = pep;
-            else
-                daint_mask_shift = pep + 16;
+    if (type != DWC2_EP_TYPE_CONTROL && type != DWC2_EP_TYPE_BULK && type != DWC2_EP_TYPE_INTR) {
+        usb_error_printf("Unsupported endpoint type [%u] for activation\n", type);
+        return -1;
+    }
+    if (is_endpoint_in) {
+        ep_ctl_reg = dev->regs + DWC2_DIEPCTL(pep);
+        // usb_debug_printf("dev->regs + DWC2_DIEPCTL(pep) = %x\n", dev->regs +
+        // DWC2_DIEPCTL(pep));
+        write32(ep_ctl_reg, 0);
+        u8 next_tx_fifo = pep;
+        val |= next_tx_fifo << 22; // TX_FIFO_SHIFT
+        write32(dev->regs + DWC2_DTXFSIZ(next_tx_fifo), TX_FIFO_SIZE << 16 | next_tx_fifo_addr);
+        // usb_debug_printf("DWC2_DTXFSIZ(next_tx_fifo)= %x\n", DWC2_DTXFSIZ(next_tx_fifo));
+        next_tx_fifo_addr += TX_FIFO_SIZE;
+        if (ep == 4)
+            val |= 1 << 26; // CNAK
+        daint_mask_shift = pep;
+    }
+    else {
+        ep_ctl_reg = dev->regs + DWC2_DOEPCTL(pep);
+        write32(ep_ctl_reg, 0);
+        daint_mask_shift = pep + 16;
     }
     if (ep_ctl_reg)
-        write32(ep_ctl_reg, val | type << 18 | 1 << 15 | max_packet_len);
+        write32(ep_ctl_reg, val | type << 18 | DWC2_DXEPCTL_ActivateEP | max_packet_len);
     set32(dev->regs + DWC2_DAINTMSK, (1 << daint_mask_shift));
-    // if(type == DWC3_DEPCMD_TYPE_INTR || type == DWC3_DEPCMD_TYPE_BULK) {
-    //     if (is_endpoint_in) {//sted0pid|snak|txfnum|peptype|usbactpep|mps
-    //         write32(dev->regs + DWC2_DIEPCTL(pep), 0);
-    //         u32 next_fifo = pep;
-    //         write32(dev->regs + DWC2_DOEPCTL(pep),  | (type << 18)
-    //         |   (1 << 15) | max_packet_len);
-    //     }
-    //     else {
-    //         write32(dev->regs + DWC2_DOEPCTL(pep), 0);
-    //         write32(dev->regs + DWC2_DOEPCTL(pep), (1 << 28) | (1 << 27) | (type << 18)
-    //         |   (1 << 15) | max_packet_len);
-    //     }
-    // }
-    // if (!is_endpoint_in) pep += 16;//offset in reg
-
-    // set32(dev->regs + DWC2_DAINTMSK, (1 << pep));//enable endpoint interrupt
-    // if(ep==USB_LEP_CDC_BULK_IN || ep==USB_LEP_CDC_BULK_OUT ) {
-    //     usb_debug_printf("****after activate inner, dev->regs + DWC2_DAINTMSK=%x\n",
-    //     read32(dev->regs + DWC2_DAINTMSK)); usb_debug_printf("reg=0x%llx, val=0x%x\n",
-    //     ep_ctl_reg, val | type << 18 | 1 << 15 | max_packet_len);
-    // }
-
     return 0;
 }
 
@@ -576,16 +550,16 @@ static void usb_dwc2_ep_set_stall(dwc2_dev_t *dev, u8 ep, u8 stall)
     if (stall) {
         if (pep & 0x80) { // dir_in
             pep &= 0xf;
-            set32(dev->regs + DWC2_DIEPCTL(pep), 0x200000);
+            set32(dev->regs + DWC2_DIEPCTL(pep), DWC2_DXEPCTL_Stall);
         } else {
-            set32(dev->regs + DWC2_DOEPCTL(pep), 0x200000);
+            set32(dev->regs + DWC2_DOEPCTL(pep), DWC2_DXEPCTL_Stall);
         }
     } else {
         if (pep & 0x80) { // dir_in
             pep &= 0xf;
-            clear32(dev->regs + DWC2_DIEPCTL(pep), 0x200000);
+            clear32(dev->regs + DWC2_DIEPCTL(pep), DWC2_DXEPCTL_Stall);
         } else {
-            clear32(dev->regs + DWC2_DOEPCTL(pep), 0x200000);
+            clear32(dev->regs + DWC2_DOEPCTL(pep), DWC2_DXEPCTL_Stall);
         }
     }
 }
@@ -700,19 +674,19 @@ static void usb_dwc2_ep0_handle_standard_device(dwc2_dev_t *dev,
                     //     usb_dwc2_enable_ep(dev, i, 0);
                     // }
                     dev->ep0_state = USB_DWC2_EP0_STATE_DATA_SEND_STATUS;
-                    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
+                    for (int i = 0; i < CDC_ACM_DWC2_PIPE_MAX; i++)
                         dev->pipe[i].ready = false;
                     break;
                 case 1:
-                    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
+                    for (int i = 0; i < CDC_ACM_DWC2_PIPE_MAX; i++) {
                         /* prepare INTR endpoint so that we don't have to reconfigure this device
                          * later */
-                        usb_dwc2_ep_activate(dev, dev->pipe[i].ep_intr, DWC3_DEPCMD_TYPE_INTR, 64);
+                        usb_dwc2_ep_activate(dev, dev->pipe[i].ep_intr, DWC2_EP_TYPE_INTR, 64);
 
                         /* prepare BULK endpoints so that we don't have to reconfigure this device
                          * later */
-                        usb_dwc2_ep_activate(dev, dev->pipe[i].ep_in, DWC3_DEPCMD_TYPE_BULK, 512);
-                        usb_dwc2_ep_activate(dev, dev->pipe[i].ep_out, DWC3_DEPCMD_TYPE_BULK, 512);
+                        usb_dwc2_ep_activate(dev, dev->pipe[i].ep_in, DWC2_EP_TYPE_BULK, 512);
+                        usb_dwc2_ep_activate(dev, dev->pipe[i].ep_out, DWC2_EP_TYPE_BULK, 512);
                     }
                     dev->ep0_state = USB_DWC2_EP0_STATE_DATA_SEND_STATUS;
                     break;
@@ -1008,13 +982,13 @@ ringbuffer_t *usb_dwc2_cdc_get_ringbuffer(dwc2_dev_t *dev, u8 endpoint_number)
 {
     switch (endpoint_number) {
         case USB_LEP_CDC_BULK_IN:
-            return dev->pipe[CDC_ACM_PIPE_0].device2host;
+            return dev->pipe[CDC_ACM_DWC2_PIPE_0].device2host;
         case USB_LEP_CDC_BULK_OUT:
-            return dev->pipe[CDC_ACM_PIPE_0].host2device;
+            return dev->pipe[CDC_ACM_DWC2_PIPE_0].host2device;
         case USB_LEP_CDC_BULK_IN_2:
-            return dev->pipe[CDC_ACM_PIPE_1].device2host;
+            return dev->pipe[CDC_ACM_DWC2_PIPE_1].device2host;
         case USB_LEP_CDC_BULK_OUT_2:
-            return dev->pipe[CDC_ACM_PIPE_1].host2device;
+            return dev->pipe[CDC_ACM_DWC2_PIPE_1].host2device;
         default:
             return NULL;
     }
@@ -1216,14 +1190,12 @@ static void usb_dwc2_ep_hw_recv(dwc2_dev_t *dev, u8 ep, u32 hw_xfer_size, u32 pa
     if (!ep) {//EP0
         // usb_debug_printf("usb_dwc2_ep_hw_recv with EP0out now:  state=%s\n", ep0_state_names[dev->ep0_state]);
         if (dev->ep0_state == USB_DWC2_EP0_STATE_DATA_RECV)
-            set32(dev->regs + DWC2_DOEPCTL(pep), 0x84000000);
+            set32(dev->regs + DWC2_DOEPCTL(pep), DWC2_DXEPCTLi_EnableEP|DWC2_DXEPCTL_ClearNAK);
         else
-            set32(dev->regs + DWC2_DOEPCTL(pep), 0x80000000);
+            set32(dev->regs + DWC2_DOEPCTL(pep), DWC2_DXEPCTLi_EnableEP);
     }
     else
-        set32(dev->regs + DWC2_DOEPCTL(pep), 0x84000000);
-    // not working: set32(dev->regs + DWC2_DOEPCTL(pep), (dev->ep0_state ==
-    // USB_DWC2_EP0_STATE_SETUP_HANDLE?0x84000000:0x80000000));
+        set32(dev->regs + DWC2_DOEPCTL(pep), DWC2_DXEPCTLi_EnableEP|DWC2_DXEPCTL_ClearNAK);
 }
 
 static void usb_dwc2_ep_hw_send(dwc2_dev_t *dev, u8 ep, u32 hw_xfer_size, u32 packet_count)
@@ -1239,14 +1211,9 @@ static void usb_dwc2_ep_hw_send(dwc2_dev_t *dev, u8 ep, u32 hw_xfer_size, u32 pa
     dma_rmb();
     write32(dev->regs + DWC2_DIEPDMA(pep), (uintptr_t)dev->endpoints[ep].xfer_buffer);
     write32(dev->regs + DWC2_DIEPTSIZ(pep), (packet_count << 19) | hw_xfer_size);
-    set32(dev->regs + DWC2_DIEPCTL(pep), 0x84000000);
-    // if(pep == 2) {
-    //     usb_debug_printf("@@DWC2_DIEPCTL 2 at %p\n", dev->regs + DWC2_DIEPCTL(2));
-    //     usb_debug_printf("****after wrote, dev->regs + DWC2_DIEPCTL(2)=%x\n", read32(dev->regs +
-    //     DWC2_DIEPCTL(2)));
-    // }
+    set32(dev->regs + DWC2_DIEPCTL(pep), DWC2_DXEPCTLi_EnableEP|DWC2_DXEPCTL_ClearNAK);
     if (pep == 0)
-        set32(dev->regs + DWC2_DOEPCTL(pep), 0x04000000); // set cak
+        set32(dev->regs + DWC2_DOEPCTL(pep), DWC2_DXEPCTL_ClearNAK); // set cak
     dev->endpoints[ep].in_flight = hw_xfer_size;
 }
 
@@ -1266,8 +1233,8 @@ static void usb_dwc2_handle_usbrst(dwc2_dev_t *dev)
     write32(dev->regs + DWC2_DOEPMSK, 0);
     write32(dev->regs + DWC2_DIEPMSK, 0);
     write32(dev->regs + DWC2_DAINTMSK, 0);
-    write32(dev->regs + DWC2_DIEPINT(0), 0x1f);
-    write32(dev->regs + DWC2_DOEPINT(0), 0xf);
+    write32(dev->regs + DWC2_DIEPINT(0), DWC2_DIEPINT_XferCompl|DWC2_DIEPINT_EPDisabled|DWC2_DIEPINT_AHBErr|DWC2_DIEPINT_TimeOUT|DWC2_DIEPINT_InTokenTXFifoEmpty);
+    write32(dev->regs + DWC2_DOEPINT(0), DWC2_DOEPINT_XFER_COMPL|DWC2_DOEPINT_EPDisabled|DWC2_DOEPINT_AHBErr|DWC2_DOEPINT_SETUP);
     write32(dev->regs + DWC2_GRXFSIZ, RX_FIFO_SIZE);
     write32(dev->regs + DWC2_GNPTXFSIZ, (TX_FIFO_SIZE << 16) | RX_FIFO_SIZE); //   64 bytes
     write32(dev->regs + DWC2_DTXFSIZ(1), 0x0040022b);                         //  256 bytes
@@ -1278,9 +1245,9 @@ static void usb_dwc2_handle_usbrst(dwc2_dev_t *dev)
     write32(dev->regs + DWC2_DIEPCTL(0), 0);
     write32(dev->regs + DWC2_GINTSTS,
             read32(dev->regs + DWC2_GINTSTS)); // write bit 1 to clear int status before enable it
-    set32(dev->regs + DWC2_GINTMSK, 0xc0000);
-    write32(dev->regs + DWC2_DOEPMSK, 0xd);
-    write32(dev->regs + DWC2_DIEPMSK, 0xd);
+    set32(dev->regs + DWC2_GINTMSK, DWC2_GINTMSK_IEPIntMsk|DWC2_GINTMSK_OEPIntMsk);
+    write32(dev->regs + DWC2_DOEPMSK, DWC2_DOEPMSK_XferComplMsk|DWC2_DOEPMSK_AHBErrMsk|DWC2_DOEPMSK_SetUPMsk);
+    write32(dev->regs + DWC2_DIEPMSK, DWC2_DIEPMSK_XferComplMsk|DWC2_DIEPMSK_AHBErrMsk|DWC2_DIEPMSK_TimeOUTMsk);
     write32(dev->regs + DWC2_DAINTMSK, 0);
     // usb_dwc2_ep_enable_recv(dev, USB_LEP_CTRL_OUT);
     /* clear STALL mode for all endpoints */
@@ -1296,10 +1263,10 @@ static void usb_dwc2_ep_abort(dwc2_dev_t *dev, u8 ep)
     if (pep & 0x80) { // dir_in
         pep &= 0xf;
         // usb_debug_printf("EP%u IN abort\n", pep);
-        if (read32(dev->regs + DWC2_DIEPCTL(pep)) & 0x80000000) {
-            set32(dev->regs + DWC2_DIEPCTL(pep), 0x40000000);
+        if (read32(dev->regs + DWC2_DIEPCTL(pep)) & DWC2_DXEPCTLi_EnableEP) {
+            set32(dev->regs + DWC2_DIEPCTL(pep), DWC2_DXEPCTLi_DisableEP);
             while (1) {
-                if (read32(dev->regs + DWC2_DIEPINT(pep)) & 0x2) {
+                if (read32(dev->regs + DWC2_DIEPINT(pep)) & DWC2_DIEPINT_EPDisabled) {
                     break;
                 }
             }
@@ -1308,22 +1275,22 @@ static void usb_dwc2_ep_abort(dwc2_dev_t *dev, u8 ep)
         return;
     }
     // usb_debug_printf("EP%u OUT abort\n", pep); // dir_out
-    if (read32(dev->regs + DWC2_DOEPCTL(pep)) & 0x80000000) {
-        write32(dev->regs + DWC2_GINTSTS, 0x80); // goutnakeff
-        set32(dev->regs + DWC2_DCTL, 0x200);     // sgoutnak
+    if (read32(dev->regs + DWC2_DOEPCTL(pep)) & DWC2_DXEPCTLi_EnableEP) {
+        write32(dev->regs + DWC2_GINTSTS, DWC2_GINTSTS_GOUTNakEff);
+        set32(dev->regs + DWC2_DCTL, DWC2_DCTL_SGOUTNak);
         while (1) {
-            if (read32(dev->regs + DWC2_GINTSTS) & 0x80) {
+            if (read32(dev->regs + DWC2_GINTSTS) & DWC2_GINTSTS_GOUTNakEff) {
                 break;
             }
         }
-        write32(dev->regs + DWC2_GINTSTS, 0x80);
-        set32(dev->regs + DWC2_DOEPCTL(pep), 0x48000000);
+        write32(dev->regs + DWC2_GINTSTS, DWC2_GINTSTS_GOUTNakEff);
+        set32(dev->regs + DWC2_DOEPCTL(pep), DWC2_DXEPCTLi_DisableEP|DWC2_DXEPCTL_SetNAK);
         while (1) {
-            if (read32(dev->regs + DWC2_DOEPINT(pep)) & 0x2) {
+            if (read32(dev->regs + DWC2_DOEPINT(pep)) & DWC2_DOEPINT_EPDisabled) {
                 break;
             }
         }
-        set32(dev->regs + DWC2_DCTL, 0x400);
+        set32(dev->regs + DWC2_DCTL, DWC2_DCTL_CGOUTNak);
     }
     write32(dev->regs + DWC2_DOEPINT(pep), read32(dev->regs + DWC2_DOEPINT(pep)));
 }
@@ -1348,7 +1315,7 @@ static void usb_dwc2_handle_event_connect_done(dwc2_dev_t *dev)
     dev->ep0_read_buffer_len = 0;
 }
 
-#define SUPPORTED_GINST 0xc3000 // RST | EnumDone | IEPInt OEPInt
+#define SUPPORTED_GINST (DWC2_GINTSTS_USBRst | DWC2_GINTSTS_ENUMDone | DWC2_GINTSTS_IEPInt | DWC2_GINTSTS_OEPInt)
 
 void usb_dwc2_handle_interrupts(dwc2_dev_t *dev)
 {
@@ -1362,13 +1329,13 @@ void usb_dwc2_handle_interrupts(dwc2_dev_t *dev)
         write32(dev->regs + DWC2_GINTSTS,
                 val & SUPPORTED_GINST); // clear supported flags,set 1 to clear
         gintsts = gintsts | val;        // current sts
-        if (gintsts & 0x1000) {
+        if (gintsts & DWC2_GINTSTS_USBRst) {
             usb_dwc2_handle_usbrst(dev);
         }
-        if ((gintsts & 0x2000) && !(val & BIT(11))) {//not in suspend state
+        if ((gintsts & DWC2_GINTSTS_ENUMDone) && !(val & DWC2_GINTSTS_USBSuspend)) {//not in suspend state
             usb_dwc2_handle_event_connect_done(dev);
         }
-        if (gintsts & 0xc0000) {
+        if (gintsts & (DWC2_GINTSTS_OEPInt|DWC2_GINTSTS_IEPInt)) {
             usb_dwc2_handle_interrupts_ep(dev);
             // usb_debug_printf("daintmask=0x%x\n", read32(dev->regs + DWC2_DAINTMSK));
             // EP interrupt
@@ -1392,7 +1359,7 @@ dwc2_dev_t *usb_dwc2_init(u64 regs)
         return NULL;
 
     memset(dev, 0, sizeof(*dev));
-    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++)
+    for (int i = 0; i < CDC_ACM_DWC2_PIPE_MAX; i++)
         memcpy(dev->pipe[i].cdc_line_coding, cdc_default_line_coding,
                sizeof(cdc_default_line_coding));
 
@@ -1418,15 +1385,15 @@ dwc2_dev_t *usb_dwc2_init(u64 regs)
     }
 
     /* prepare CDC ACM interfaces */
-    dev->pipe[CDC_ACM_PIPE_0].ep_intr = USB_LEP_CDC_INTR_IN;
-    dev->pipe[CDC_ACM_PIPE_0].ep_in = USB_LEP_CDC_BULK_IN;
-    dev->pipe[CDC_ACM_PIPE_0].ep_out = USB_LEP_CDC_BULK_OUT;
+    dev->pipe[CDC_ACM_DWC2_PIPE_0].ep_intr = USB_LEP_CDC_INTR_IN;
+    dev->pipe[CDC_ACM_DWC2_PIPE_0].ep_in = USB_LEP_CDC_BULK_IN;
+    dev->pipe[CDC_ACM_DWC2_PIPE_0].ep_out = USB_LEP_CDC_BULK_OUT;
 
-    dev->pipe[CDC_ACM_PIPE_1].ep_intr = USB_LEP_CDC_INTR_IN_2;
-    dev->pipe[CDC_ACM_PIPE_1].ep_in = USB_LEP_CDC_BULK_IN_2;
-    dev->pipe[CDC_ACM_PIPE_1].ep_out = USB_LEP_CDC_BULK_OUT_2;
+    dev->pipe[CDC_ACM_DWC2_PIPE_1].ep_intr = USB_LEP_CDC_INTR_IN_2;
+    dev->pipe[CDC_ACM_DWC2_PIPE_1].ep_in = USB_LEP_CDC_BULK_IN_2;
+    dev->pipe[CDC_ACM_DWC2_PIPE_1].ep_out = USB_LEP_CDC_BULK_OUT_2;
 
-    for (int i = 0; i < CDC_ACM_PIPE_MAX; i++) {
+    for (int i = 0; i < CDC_ACM_DWC2_PIPE_MAX; i++) {
         dev->pipe[i].host2device = ringbuffer_alloc(CDC_BUFFER_SIZE);
         if (!dev->pipe[i].host2device)
             goto error;
@@ -1471,7 +1438,7 @@ void usb_dwc2_shutdown(dwc2_dev_t *dev)
     set32(dev->regs + DWC2_DCTL, 0x2);
 }
 
-u8 usb_dwc2_getbyte(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe)
+u8 usb_dwc2_getbyte(dwc2_dev_t *dev, cdc_acm_dwc2_pipe_id_t pipe)
 {
     ringbuffer_t *host2device = dev->pipe[pipe].host2device;
     if (!host2device)
@@ -1487,7 +1454,7 @@ u8 usb_dwc2_getbyte(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe)
     return c;
 }
 
-void usb_dwc2_putbyte(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe, u8 byte)
+void usb_dwc2_putbyte(dwc2_dev_t *dev, cdc_acm_dwc2_pipe_id_t pipe, u8 byte)
 {
     ringbuffer_t *device2host = dev->pipe[pipe].device2host;
     if (!device2host)
@@ -1501,7 +1468,7 @@ void usb_dwc2_putbyte(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe, u8 byte)
     }
 }
 
-size_t usb_dwc2_queue(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
+size_t usb_dwc2_queue(dwc2_dev_t *dev, cdc_acm_dwc2_pipe_id_t pipe, const void *buf, size_t count)
 {
     const u8 *p = buf;
     size_t wrote, sent = 0;
@@ -1529,7 +1496,7 @@ size_t usb_dwc2_queue(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, 
     return sent;
 }
 
-size_t usb_dwc2_write(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, size_t count)
+size_t usb_dwc2_write(dwc2_dev_t *dev, cdc_acm_dwc2_pipe_id_t pipe, const void *buf, size_t count)
 {
     if (!dev)
         return -1;
@@ -1547,7 +1514,7 @@ size_t usb_dwc2_write(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf, 
     return ret;
 }
 
-size_t usb_dwc2_read(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t count)
+size_t usb_dwc2_read(dwc2_dev_t *dev, cdc_acm_dwc2_pipe_id_t pipe, void *buf, size_t count)
 {
     // usb_debug_printf("***dwc2_read,count=%u\n", count);
     u8 *p = buf;
@@ -1574,7 +1541,7 @@ size_t usb_dwc2_read(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t 
     return recvd;
 }
 
-ssize_t usb_dwc2_can_read(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe)
+ssize_t usb_dwc2_can_read(dwc2_dev_t *dev, cdc_acm_dwc2_pipe_id_t pipe)
 {
     if (!dev || !dev->pipe[pipe].ready)
         return 0;
@@ -1586,7 +1553,7 @@ ssize_t usb_dwc2_can_read(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe)
     return ringbuffer_get_used(host2device);
 }
 
-bool usb_dwc2_can_write(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe)
+bool usb_dwc2_can_write(dwc2_dev_t *dev, cdc_acm_dwc2_pipe_id_t pipe)
 {
     (void)pipe;
     if (!dev)
@@ -1595,7 +1562,7 @@ bool usb_dwc2_can_write(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe)
     return dev->pipe[pipe].ready;
 }
 
-void usb_dwc2_flush(dwc2_dev_t *dev, cdc_acm_pipe_id_t pipe)
+void usb_dwc2_flush(dwc2_dev_t *dev, cdc_acm_dwc2_pipe_id_t pipe)
 {
     if (!dev || !dev->pipe[pipe].ready)
         return;
